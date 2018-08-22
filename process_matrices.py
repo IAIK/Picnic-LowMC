@@ -1,6 +1,9 @@
+#! /usr/bin/env sage
+
 from __future__ import unicode_literals
 
 from sage.all import GF, matrix, vector, copy
+from six.moves import range
 
 from generate_matrices import Instance
 import pickle, io
@@ -51,10 +54,10 @@ def print_matrix(output, name, typename, m, width=64):
 
 def calc_rowstride(rcols, width):
     bound = 128 / width
-    if rcols >= bound:
-        return ((rcols * (width / 8) + 31) & ~31) / (width / 8);
+    if rcols > bound:
+        return ((rcols * (width / 8) + 31) & ~31) / (width / 8)
     else:
-        return ((rcols * (width / 8) + 15) & ~15) / (width / 8);
+        return ((rcols * (width / 8) + 15) & ~15) / (width / 8)
 
 def print_matrix_mzd(output, name, typename, m, width=64):
     rows = m.nrows()
@@ -129,52 +132,57 @@ def main(blocksize=256, keysize=256, rounds=19, sboxes=10):
     Kt = [m.transpose() for m in Ks]
     Lt = [m.transpose() for m in Ls]
     Li = [m.inverse() for m in Lt]
-    LiK = [Kt[i + 1] * Li[i] for i in xrange(inst.r)]
+    LiK = [Kt[i + 1] * Li[i] for i in range(inst.r)]
+    LiC = [Cs[i] * Li[i] for i in range(inst.r)]
 
     mod_Li = [copy(Li[i]) for i in range(inst.r)]
     for j in range(inst.r):
-        mod_Li[j][inst.n - 3*sboxes:, :inst.n] = matrix(3 * sboxes, inst.n)
+        mod_Li[j][inst.n - 3*sboxes:, :inst.n] = matrix(F, 3 * sboxes, inst.n)
 
-    precomputed_values = [matrix(inst.n, inst.n) for i in range(inst.r)]
-    precomputed_matrix = matrix(inst.n, (sboxes * 3 + 2) * inst.r)
+    precomputed_key_matrix = None
+    precomputed_key_matrix_nl = matrix(F, inst.n, (sboxes * 3 + 2) * inst.r)
+    precomputed_constant = None
+    precomputed_constant_nl = vector(F, (sboxes * 3 + 2) * inst.r)
 
     for round in range(inst.r):
-        tmp = matrix(inst.n, inst.n)
-        tmp += copy(LiK[round])
+        tmp = copy(LiK[round])
+        tmpC = copy(LiC[round])
 
         for i in range(round + 1, inst.r):
-
-            x = copy(LiK[i])
+            x = LiK[i]
+            c = LiC[i]
             for j in range(i - 1, round - 1, -1):
-                    x = x * mod_Li[j]
+                x = x * mod_Li[j]
+                c = c * mod_Li[j]
             tmp += x
+            tmpC += c
 
-        precomputed_matrix[:inst.n, round * (3 * sboxes + 2): round * (3 * sboxes + 2) + 3 * sboxes] = tmp[:inst.n, inst.n - 3*sboxes:]
-        if round:
-            tmp[:,:inst.n - 3*sboxes] = matrix(inst.n, inst.n - 3*sboxes)
-        else: 
-            tmp[:,inst.n - 3*sboxes:] = matrix(inst.n, 3*sboxes)
-        precomputed_values[round] = tmp
+        # non-linear part
+        idx = round * (3 * sboxes + 2)
+        precomputed_key_matrix_nl[:inst.n, idx + 2:idx + 3 * sboxes + 2] = tmp[:inst.n, inst.n - 3*sboxes:]
+        precomputed_constant_nl[idx + 2:idx + 3 * sboxes + 2] = tmpC[inst.n - 3 * sboxes:]
 
-    # print(precomputed_matrix.str())
+        # linear part
+        if round == 0:
+            tmp[:,inst.n - 3*sboxes:] = matrix(F, inst.n, 3*sboxes)
+            tmpC[inst.n - 3*sboxes:] = vector(F, 3*sboxes)
+            precomputed_key_matrix = tmp
+            precomputed_constant = tmpC
 
     with io.open('lowmc_{}_{}_{}.h'.format(inst.n, inst.k, inst.r), 'w') as matfile:
-        matfile.write('''#ifndef LOWMC_{inst.n}_{inst.k}_{inst.r}
-#define LOWMC_{inst.n}_{inst.k}_{inst.r}
+        matfile.write('''#ifndef LOWMC_{inst.n}_{inst.k}_{inst.r}_H
+#define LOWMC_{inst.n}_{inst.k}_{inst.r}_H
 
-#include <stdint.h>
+#include "lowmc_pars.h"
 
-#include "mzd_additional.h"
-
-
-const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_linear_layer(uint32_t r);
-const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_round_key(uint32_t r);
-const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_round_const(uint32_t r);
-const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_precomputed_round_key_matrix_non_linear_part();
-const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_precomputed_round_key_matrix_linear_part();
+#if !defined(MUL_M4RI)
+extern const lowmc_t lowmc_{inst.n}_{inst.k}_{inst.r};
+#else
+extern lowmc_t lowmc_{inst.n}_{inst.k}_{inst.r};
+#endif
 
 #endif
-'''.format(s=inst.n / 64, inst=inst, b = int(math.ceil(inst.r * (3 * sboxes + 2) / 64.0))))
+'''.format(s=inst.n / 64, inst=inst))
 
     with io.open('lowmc_{}_{}_{}.c'.format(inst.n, inst.k, inst.r), 'w') as matfile:
         matfile.write('''#ifdef HAVE_CONFIG_H
@@ -190,80 +198,95 @@ const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_precomputed_round_key_ma
         typename = 'mzd_local_t'
 
         for i, L in enumerate(Ls):
-            print_matrix_mzd(matfile, 'L_{}_{}_{}_{}'.format(inst.n, inst.k, inst.r, i),
+            print_matrix_mzd(matfile, 'L_{}'.format(i),
                     typename, L.transpose())
             matfile.write('\n')
 
+        matfile.write('#if !defined(REDUCED_LINEAR_LAYER)')
         for i, K in enumerate(Ks):
-            print_matrix_mzd(matfile, 'K_{}_{}_{}_{}'.format(inst.n, inst.k, inst.r, i),
-                    typename, K.transpose())
             matfile.write('\n')
+            print_matrix_mzd(matfile, 'K_{}'.format(i),
+                    typename, K.transpose())
 
         for i, C in enumerate(Cs):
-            print_vector_mzd(matfile, 'C_{}_{}_{}_{}'.format(inst.n, inst.k, inst.r, i),
-                    typename, C)
             matfile.write('\n')
+            print_vector_mzd(matfile, 'C_{}'.format(i),
+                    typename, C)
+        matfile.write('#endif\n')
 
-        print_matrix_mzd(matfile, 'precomputed_round_key_matrix_linear_part_{}_{}_{}'.format(inst.n, inst.k, inst.r),
-                    'mzd_local_t', precomputed_values[0])
+        matfile.write('#if defined(REDUCED_LINEAR_LAYER)\n')
+        print_matrix_mzd(matfile, 'precomputed_round_key_matrix_linear_part',
+                    'mzd_local_t', precomputed_key_matrix + Ks[0].transpose())
         matfile.write('\n')
 
-        print_matrix_mzd(matfile, 'precomputed_round_key_matrix_non_linear_part_{}_{}_{}'.format(inst.n, inst.k, inst.r),
-                    'mzd_local_t', precomputed_matrix)
+        print_matrix_mzd(matfile, 'precomputed_round_key_matrix_non_linear_part',
+                    'mzd_local_t', precomputed_key_matrix_nl)
         matfile.write('\n')
 
-        matfile.write(
-'''const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_linear_layer(uint32_t r) {{
-  switch(r) {{
-    default:
-      return NULL;'''.format(inst=inst, s=inst.n / 64))
+        print_vector_mzd(matfile, 'precomputed_constant_linear_part', typename, precomputed_constant)
+        matfile.write('\n')
+        print_vector_mzd(matfile, 'precomputed_constant_non_linear_part', typename, precomputed_constant_nl)
+        matfile.write('#endif\n\n')
 
+        matfile.write(
+'''#if defined(MUL_M4RI)
+static lowmc_round_t rounds[{inst.r}] = {{
+#else
+static const lowmc_round_t rounds[{inst.r}] = {{
+#endif
+'''.format(inst=inst))
         for i in range(inst.r):
-            matfile.write('''
-    case {i}:
-      return &L_{inst.n}_{inst.k}_{inst.r}_{i};'''.format(i=i, inst=inst))
-
-        matfile.write('\n  }\n}\n\n')
-
-        matfile.write(
-'''const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_round_key(uint32_t r) {{
-  switch(r) {{
-    default:
-      return NULL;'''.format(inst=inst, s=inst.n / 64))
-
-        for i in range(inst.r + 1):
-            matfile.write('''
-    case {i}:
-      return &K_{inst.n}_{inst.k}_{inst.r}_{i};'''.format(i=i, inst=inst))
-
-        matfile.write('\n  }\n}\n\n')
-
-        matfile.write(
-'''const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_round_const(uint32_t r) {{
-  switch(r) {{
-    default:
-      return NULL;'''.format(inst=inst, s=inst.n / 64))
-
-        for i in range(inst.r):
-            matfile.write('''
-    case {i}:
-      return &C_{inst.n}_{inst.k}_{inst.r}_{i};'''.format(i=i, inst=inst))
-
-        matfile.write('\n  }\n}\n')
+            matfile.write(
+'''
+  {{
+#if !defined(REDUCED_LINEAR_LAYER)
+#if defined(MUL_M4RI)
+    &K_{j}, &L_{i}, &C_{i}, NULL, NULL
+#else
+    &K_{j}, &L_{i}, &C_{i}
+#endif
+#else
+#if defined(MUL_M4RI)
+    &L_{i}, NULL
+#else
+    &L_{i}
+#endif
+#endif
+  }},'''.format(inst=inst, i=i, j=i+1))
 
         matfile.write(
-'''const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_precomputed_round_key_matrix_non_linear_part() {{
-  '''.format(inst=inst, s=inst.n / 64))
-        matfile.write('return &precomputed_round_key_matrix_non_linear_part_{inst.n}_{inst.k}_{inst.r};'.format(inst=inst))
-        matfile.write('\n  }\n')
+'''
+}};
 
-
-        matfile.write(
-'''const mzd_local_t* lowmc_{inst.n}_{inst.k}_{inst.r}_get_precomputed_round_key_matrix_linear_part() {{
-  '''.format(inst=inst, s=inst.n / 64))
-        matfile.write('return &precomputed_round_key_matrix_linear_part_{inst.n}_{inst.k}_{inst.r};'.format(inst=inst))
-        matfile.write('\n  }\n')
-
+#if defined(MUL_M4RI)
+lowmc_t lowmc_{inst.n}_{inst.k}_{inst.r} = {{
+#else
+const lowmc_t lowmc_{inst.n}_{inst.k}_{inst.r} = {{
+#endif
+  {m}, {inst.n}, {inst.r}, {inst.k},
+#if defined(REDUCED_LINEAR_LAYER)
+  &precomputed_round_key_matrix_linear_part,
+#else
+  &K_0,
+#endif
+#if defined(MUL_M4RI)
+  NULL,
+#endif
+  rounds,
+#if defined(REDUCED_LINEAR_LAYER)
+  &precomputed_round_key_matrix_non_linear_part,
+#if defined(MUL_M4RI)
+  NULL,
+#endif
+  &precomputed_constant_linear_part,
+  &precomputed_constant_non_linear_part,
+#endif
+#if defined(WITH_CUSTOM_INSTANCES)
+  {{ NULL, NULL, NULL, NULL }},
+  false
+#endif
+}};
+'''.format(inst=inst, m=sboxes))
 
 if __name__ == '__main__':
     import sys

@@ -1,6 +1,12 @@
+#! /usr/bin/env sage
 
+from sage.all import GF, matrix
+from six.moves import range
 import pickle
 import io
+
+
+F = GF(2)
 
 
 class Instance(object):
@@ -34,39 +40,6 @@ def main(blocksize=256, keysize=256, rounds=19):
         mat = instantiate_matrix(blocksize, keysize, gen)
         roundkey_matrices.append(mat)
 
-    with open('matrices_and_constants_{}_{}_{}.dat'.format(blocksize, keysize, rounds), 'w') as matfile:
-        s = 'LowMC matrices and constants\n'\
-            '============================\n'\
-            'Block size: ' + str(blocksize) + '\n'\
-            'Key size: ' + str(keysize) + '\n'\
-            'Rounds: ' + str(rounds) + '\n\n'
-        matfile.write(s)
-        s = 'Linear layer matrices\n'\
-            '---------------------'
-        matfile.write(s)
-        for r in range(rounds):
-            s = '\nLinear layer ' + str(r + 1) + ':\n'
-            for row in linlayers[r]:
-                s += str(row) + '\n'
-            matfile.write(s)
-
-        s = '\nRound constants\n'\
-              '---------------------'
-        matfile.write(s)
-        for r in range(rounds):
-            s = '\nRound constant ' + str(r + 1) + ':\n'
-            s += str(round_constants[r]) + '\n'
-            matfile.write(s)
-
-        s = '\nRound key matrices\n'\
-              '---------------------'
-        matfile.write(s)
-        for r in range(rounds + 1):
-            s = '\nRound key matrix ' + str(r) + ':\n'
-            for row in roundkey_matrices[r]:
-                s += str(row) + '\n'
-            matfile.write(s)
-
     inst = Instance(blocksize, keysize, rounds, linlayers, roundkey_matrices,
             round_constants)
     with io.open('matrices_and_constants_{}_{}_{}.pickle'.format(blocksize, keysize, rounds), 'wb') as matfile:
@@ -84,35 +57,14 @@ def instantiate_matrix(n, m, gen):
             for _ in range(m):
                 row.append(next(gen))
             mat.append(row)
-        if rank(mat) >= min(n, m):
+        sagem = matrix(F, mat)
+        if sagem.rank() >= min(n, m):
             return mat
-
-def rank(matrix):
-    ''' Determine the rank of a binary matrix. '''
-    # Copy matrix
-    mat = [[x for x in row] for row in matrix]
-    
-    n = len(matrix)
-    m = len(matrix[0])
-    for c in range(m):
-        if c > n - 1:
-            return n
-        r = c
-        while mat[r][c] != 1:
-            r += 1
-            if r >= n:
-                return c
-        mat[c], mat[r] = mat[r], mat[c]
-        for r in range(c + 1, n):
-            if mat[r][c] == 1:
-                for j in range(m):
-                    mat[r][j] ^= mat[c][j]
-    return m
 
 
 def grain_ssg():
     ''' A generator for using the Grain LSFR in a self-shrinking generator. '''
-    state = [1 for _ in range(80)]
+    state = [1] * 80
     index = 0
     # Discard first 160 bits
     for _ in range(160):
